@@ -1,0 +1,382 @@
+% main_multiframe_simulation_v9_Scan.m (v9.2)
+%
+% 描述:
+%   这是一个多帧雷达仿真主脚本。
+%   (v9.1): 增加了伺服机构的模拟 (方位角)。
+%   (v9.2): (根据您的反馈) 修正了 %% 5. 帧间聚类算法，
+%           增加了第5个维度(俯仰角)的门限判断，
+%           使其成为一个完整的 5D (R, V, El, Az, Time) 聚类器。
+%
+clc; clear; close all;
+%% 0. 多帧仿真配置
+% =========================================================================
+total_frames_to_run = 50;  % <--- 在此设置要模拟的总帧数
+cumulative_final_log = []; % 用于累积所有帧的最终目标
+
+%% 1. & 2. 一次性设置 (从 v8 复制)
+% =========================================================================
+fprintf('--- 1. & 2. 正在加载所有配置参数 (来自 v8)... ---\n');
+
+% --- 1.0 (新增) 扫描配置 ---
+config.scan.rpm = 6; % 天线转速 (6 RPM = 36 deg/sec)
+config.scan.start_azimuth = 0; % 扫描起始方位 (度)
+
+% --- 1.1 目标 *初始* 状态 (t=0) ---
+clear targets;
+P_noise_floor = 1;
+
+targets(1).Range = 3000;
+targets(1).Velocity = 15;
+targets(1).ElevationAngle = 10;
+targets(1).SNR_dB = -10;
+
+targets(2).Range = 5000;
+targets(2).Velocity = 20;
+targets(2).ElevationAngle = 5;
+targets(2).SNR_dB = 1;
+
+targets(3).Range = 6500;
+targets(3).Velocity = 10;
+targets(3).ElevationAngle = 15;
+targets(3).SNR_dB = -20;
+
+targets(4).Range = 8000;
+targets(4).Velocity = 5;
+targets(4).ElevationAngle = 20;
+targets(4).SNR_dB = 5;
+
+targets(5).Range = 10000;
+targets(5).Velocity = 8;
+targets(5).ElevationAngle = 8;
+targets(5).SNR_dB = 15;
+
+% --- 1.2 文件路径 ---
+base_path = 'C:\Users\a\Desktop\9.8 问题\Simulation'; % <--- !! 检查路径
+dbf_coef_path = fullfile(base_path, 'X8数据采集250522_DBFcoef.csv');
+
+% --- 1.3 CFAR 参数 ---
+cfar_params.refCells_V = 5;      
+cfar_params.guardCells_V = 10;
+cfar_params.refCells_R = 5;      
+cfar_params.guardCells_R = 10;
+cfar_params.T_CFAR = 8;          
+cfar_params.method = 'GOCA';  % CFAR 选大
+
+% --- 1.4 帧内聚类参数 (波束内/间) ---
+cluster_params.max_range_sep = 30;
+cluster_params.max_vel_sep = 0.4;
+cluster_params.max_angle_sep = 5.0; % (v8 - Stage 1)
+
+% --- 1.5 帧间聚类 (航迹关联) 参数 ---
+config.inter_frame_cluster.enable = true; % <--- 总开关
+% 1. 门限倍数（K值）
+config.inter_frame_cluster.K = 1;
+% 2. 关联门限
+config.inter_frame_cluster.Gate_R = cluster_params.max_range_sep * config.inter_frame_cluster.K;  % (m) 帧内距离门限
+config.inter_frame_cluster.Gate_V = cluster_params.max_vel_sep * config.inter_frame_cluster.K;    % (m/s) 帧内速度门限
+config.inter_frame_cluster.Gate_El = cluster_params.max_angle_sep * config.inter_frame_cluster.K; % (度) 帧内俯仰角门限
+config.inter_frame_cluster.Gate_Az = 10.0; % (度) 帧内方位角门限，可以设得更宽
+% 3. "中断值" (连续 N 帧未出现相似点则中断)
+config.inter_frame_cluster.Max_Frame_Gap = 3; 
+
+
+% --- 2.1 & 2.3 基础与派生参数 ---
+% (从 v9.1 复制... 此处省略以保持简洁)
+config.Sig_Config.c = 2.99792458e8;
+config.Sig_Config.fs = 25e6;
+config.Sig_Config.fc = 9450e6;
+config.Sig_Config.prtNum = 332;
+config.Sig_Config.prt = 232.76e-6;
+config.Sig_Config.B = 20e6;
+config.Sig_Config.tao = [0.16e-6, 8e-6, 28e-6];
+config.Sig_Config.gap_duration = [11.4e-6, 31.8e-6, 153.4e-6];
+config.Sig_Config.point_prt_segments = [228, 723, 2453];
+config.Sig_Config.channel_num = 16;
+config.Sig_Config.beam_num = 13;
+config.Array.element_spacing = 0.0138;
+config.Sig_Config.wavelength = config.Sig_Config.c / config.Sig_Config.fc;
+ts = 1 / config.Sig_Config.fs;
+num_all_prt = round(config.Sig_Config.prt * config.Sig_Config.fs ); % 5819
+config.Sig_Config.point_PRT = num_all_prt; 
+N_total_gate = sum(config.Sig_Config.point_prt_segments); % 3404
+
+%% 3. 预计算 (从 v9.1 完整复制)
+% =========================================================================
+fprintf('--- 3. 正在预计算所有滤波器、波形和系数... ---\n');
+precomputed_data = struct();
+
+% --- 3.0 帧时间 和 扫描增量 ---
+T_frame = config.Sig_Config.prtNum * config.Sig_Config.prt;
+deg_per_sec = config.scan.rpm * (360 / 60);
+config.scan.deg_per_frame = deg_per_sec * T_frame;
+precomputed_data.T_frame = T_frame;
+fprintf('  > 仿真配置: %.1f RPM = %.2f deg/sec = %.3f deg/frame\n', ...
+    config.scan.rpm, deg_per_sec, config.scan.deg_per_frame);
+
+% --- 3.1 生成发射波形 (v8 %% 3) ---
+tau1 = config.Sig_Config.tao(1); tau2 = config.Sig_Config.tao(2); tau3 = config.Sig_Config.tao(3);
+gap_duration1 = config.Sig_Config.gap_duration(1); gap_duration2 = config.Sig_Config.gap_duration(2);
+k2 = -config.Sig_Config.B/tau2; k3 = config.Sig_Config.B/tau3;
+num_samples_1 = round(tau1 * config.Sig_Config.fs);
+num_samples_2 = round(tau2 * config.Sig_Config.fs);
+num_samples_3 = round(tau3 * config.Sig_Config.fs);
+t2 = linspace(-tau2/2, tau2/2, num_samples_2);
+t3 = linspace(-tau3/2, tau3/2, num_samples_3);
+pulse1 = ones(1, num_samples_1);
+pulse2 = exp(1j*2*pi*(0.5*k2*(t2.^2)));
+pulse3 = exp(1j*2*pi*(0.5*k3*(t3.^2)));
+tx_pulse = complex(zeros(1, num_all_prt));
+tx_pulse(1:num_samples_1) = pulse1;
+offset1 = round((tau1+gap_duration1) * config.Sig_Config.fs);
+tx_pulse(offset1+1 : offset1+num_samples_2) = pulse2;
+offset2 = offset1 + round((tau2+gap_duration2) * config.Sig_Config.fs);
+tx_pulse(offset2+1 : offset2+num_samples_3) = pulse3;
+precomputed_data.tx_pulse = tx_pulse;
+precomputed_data.P_signal_unscaled = mean(abs(tx_pulse(tx_pulse ~= 0)).^2);
+
+% --- 3.2 生成匹配滤波器 (v8 %% 6.1) ---
+fir_coeffs = [794,1403,2143,2672,2591,1711,-58,-2351,-4592,-5855,-5338,-2389,3005,10341,18410,25779,30907,32768,30907,25779,18410,10341,3005,-2389,-5338,-5855,-4592,-2351,-58,1711,2591,2672,2143,1403,794];
+fir_coeffs = 6 * fir_coeffs/max(fir_coeffs); 
+precomputed_data.MF_narrow = fir_coeffs;
+precomputed_data.fir_delay = round(mean(grpdelay(fir_coeffs)));
+win_medium = kaiser(length(pulse2), 4.5); 
+precomputed_data.MF_medium_win = fliplr(conj(pulse2 .* win_medium'));
+win_long = kaiser(length(pulse3), 4.5); 
+precomputed_data.MF_long_win = fliplr(conj(pulse3 .* win_long'));
+
+% --- 3.3 (优化) 预计算频域滤波器 ---
+L_h_med = length(precomputed_data.MF_medium_win);
+L_h_long = length(precomputed_data.MF_long_win);
+gap_duration1_num = gap_duration1 * config.Sig_Config.fs;
+gap_duration2_num = gap_duration2 * config.Sig_Config.fs;
+seg_start_medium = num_samples_1 + gap_duration1_num + num_samples_2 + 1;
+seg_start_long = num_samples_1 + gap_duration1_num + num_samples_2 + gap_duration2_num + num_samples_3 + 1;
+L_s_med = num_all_prt - seg_start_medium + 1;
+L_s_long = num_all_prt - seg_start_long + 1;
+precomputed_data.N_fft_med = 2^nextpow2(L_s_med + L_h_med - 1);
+precomputed_data.N_fft_long = 2^nextpow2(L_s_long + L_h_long - 1);
+precomputed_data.MF_medium_fft = fft(precomputed_data.MF_medium_win, precomputed_data.N_fft_med, 2);
+precomputed_data.MF_long_fft = fft(precomputed_data.MF_long_win, precomputed_data.N_fft_long, 2);
+
+% --- 3.4 预计算拼接参数 (v8 %% 6.2) ---
+precomputed_data.N_gate_narrow = config.Sig_Config.point_prt_segments(1);
+precomputed_data.N_gate_medium = config.Sig_Config.point_prt_segments(2);
+precomputed_data.N_gate_long = config.Sig_Config.point_prt_segments(3);
+precomputed_data.N_total_gate = N_total_gate;
+precomputed_data.seg_start_narrow = num_samples_1 + 1;
+precomputed_data.seg_start_medium = seg_start_medium;
+precomputed_data.seg_start_long = seg_start_long;
+
+% --- 3.5 预计算 MTD 窗 (v8 %% 7) ---
+precomputed_data.MTD_win = kaiser(config.Sig_Config.prtNum, 4.5);
+
+% --- 3.6 预计算坐标轴 (v8 %% 9) ---
+v_max = config.Sig_Config.wavelength / (2 * config.Sig_Config.prt);
+precomputed_data.velocity_axis = linspace(-v_max/2, v_max/2, config.Sig_Config.prtNum);
+precomputed_data.range_axis = (1:N_total_gate) * (config.Sig_Config.c / (2 * config.Sig_Config.fs));
+precomputed_data.deltaR = config.Sig_Config.c*ts/2; 
+precomputed_data.deltaV = v_max / config.Sig_Config.prtNum;
+precomputed_data.beam_angles_deg = [-16, -9.6, -3.2, 3.2, 9.6, 16, 22.6, 29.2, 36.1, 43.3, 51, 59.6, 70.3];
+precomputed_data.k_slopes_LUT = [-4.6391,-4.6888,-4.7578,-4.7891,-4.7214,-4.7513,-5.2343,-5.4529,-5.7323,-6.1685,-7.0256,-8.7612];
+
+% --- 3.7 加载 DBF 系数 (v8 %% 5) ---
+try
+    DBF_coeffs_data = readmatrix(dbf_coef_path);
+    precomputed_data.DBF_coeffs_data_C = DBF_coeffs_data(:, 1:2:end) + 1j * DBF_coeffs_data(:, 2:2:end);
+catch E
+    fprintf('错误: 无法加载 DBF 系数文件 !!!\n');
+    fprintf('请检查路径: %s\n', dbf_coef_path);
+    rethrow(E);
+end
+fprintf('--- 预计算完成。进入主仿真循环。 ---\n');
+
+%% 4. 主循环 (多帧仿真)
+% =========================================================================
+current_azimuth = config.scan.start_azimuth;
+tic;
+for frame_idx = 1 : total_frames_to_run
+    fprintf('\n--- 正在处理第 %d 帧 / 共 %d 帧 ---\n', frame_idx, total_frames_to_run);
+    
+    % --- 4.1. 状态演进 (State Evolution) ---
+    fprintf('  (S4.1) 正在更新状态 (帧 %d): Az = %.2f deg\n', frame_idx, current_azimuth);
+    for k = 1:length(targets)
+        targets(k).Range = targets(k).Range - (targets(k).Velocity * T_frame);
+    end
+    current_azimuth = mod(current_azimuth + config.scan.deg_per_frame, 360);
+    
+    % --- 4.2. 运行 v8 的处理核 ---
+    [final_targets] = fun_process_single_frame(targets, config, cfar_params, ...
+        cluster_params, precomputed_data, frame_idx);
+    
+    % --- 4.3. 累积结果 (注入 iFrame 和 iAntAngle) ---
+    if ~isempty(final_targets)
+        num_goals = length(final_targets);
+        frame_num_cell = num2cell(repmat(frame_idx, 1, num_goals));
+        ant_angle_cell = num2cell(repmat(current_azimuth, 1, num_goals));
+        
+        [final_targets.iFrame] = deal(frame_num_cell{:});
+        [final_targets.iAntAngle] = deal(ant_angle_cell{:});
+        
+        cumulative_final_log = [cumulative_final_log, final_targets];
+    end
+end % (结束主循环)
+simulation_time = toc;
+fprintf('\n--- 多帧仿真全部完成 ---\n');
+fprintf('总共处理了 %d 帧, 累积了 %d 个检测点。\n', total_frames_to_run, length(cumulative_final_log));
+
+%% 5. 帧间聚类 (航迹关联) (v9.2 最终版)
+% =========================================================================
+if config.inter_frame_cluster.enable
+    fprintf('--- 5. 正在执行帧间聚类 (5D 航迹关联)...\n');
+    
+    % --- 5.1 提取输入数据和门限 ---
+    detection_log = cumulative_final_log; % (来自 %% 4.3 的总日志)
+    num_detections = length(detection_log);
+    
+    Gate_R = config.inter_frame_cluster.Gate_R;
+    Gate_V = config.inter_frame_cluster.Gate_V;
+    Gate_Az = config.inter_frame_cluster.Gate_Az;
+    Gate_El = config.inter_frame_cluster.Gate_El; % <--- (v9.2 新增)
+    Max_Frame_Gap = config.inter_frame_cluster.Max_Frame_Gap;
+    
+    if num_detections == 0
+        fprintf('  > 总日志为空，无需进行帧间聚类。\n');
+        final_tracks_log = [];
+    else
+        % --- 5.2 聚类算法核心 (BFS) ---
+        cluster_IDs_final = zeros(num_detections, 1);
+        current_cluster_ID = 0;
+        
+        for i = 1:num_detections
+            if cluster_IDs_final(i) == 0
+                current_cluster_ID = current_cluster_ID + 1;
+                points_to_visit = i;
+                while ~isempty(points_to_visit)
+                    current_idx = points_to_visit(1);
+                    points_to_visit(1) = [];
+                    if cluster_IDs_final(current_idx) == 0
+                        cluster_IDs_final(current_idx) = current_cluster_ID;
+                        for j = 1:num_detections
+                            if cluster_IDs_final(j) == 0
+                                % --- 核心: 5D 门限 (R, V, Az, El, Frame) ---
+                                dist_r = abs(detection_log(current_idx).Range - detection_log(j).Range);
+                                dist_v = abs(detection_log(current_idx).Velocity - detection_log(j).Velocity);
+                                dist_az = abs(detection_log(current_idx).iAntAngle - detection_log(j).iAntAngle);
+                                dist_el = abs(detection_log(current_idx).Angle - detection_log(j).Angle); % <--- (v9.2 新增)
+                                dist_frame = abs(detection_log(current_idx).iFrame - detection_log(j).iFrame);
+                                
+                                if (dist_r <= Gate_R) && ...
+                                   (dist_v <= Gate_V) && ...
+                                   (dist_az <= Gate_Az) && ...
+                                   (dist_el <= Gate_El) && ... % <--- (v9.2 新增)
+                                   (dist_frame <= Max_Frame_Gap)
+                                
+                                    points_to_visit(end+1) = j;
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        num_final_clusters = current_cluster_ID;
+        fprintf('  > 帧间聚类完成，将 %d 个总检测点合并为 %d 条唯一航迹。\n', num_detections, num_final_clusters);
+
+        % --- 5.3 对每个簇进行合并 (混合归并策略) ---
+        final_tracks_log = repmat(struct('Range', 0, 'Velocity', 0, 'Angle', 0, 'Azimuth', 0, 'Power', 0, 'FirstFrame', 0, 'LastFrame', 0, 'NumPoints', 0), num_final_clusters, 1);
+        
+        for i = 1:num_final_clusters
+            cluster_mask = (cluster_IDs_final == i);
+            detections_in_cluster = detection_log(cluster_mask);
+            
+            powers = [detections_in_cluster.Power]';
+            total_power = sum(powers);
+            
+            % --- 1. (赢家通吃) 找到功率最高的"赢家" ---
+            [~, idx_winner] = max(powers);
+            winner_detection = detections_in_cluster(idx_winner);
+            
+            % --- 2. (加权平均) 计算方位角 ---
+            angles_az = [detections_in_cluster.iAntAngle]';
+            final_azimuth = sum(angles_az .* powers) / total_power;
+            
+            % --- 3. 存储归并结果 ---
+            final_tracks_log(i).Range = winner_detection.Range;       % 赢家的距离
+            final_tracks_log(i).Velocity = winner_detection.Velocity; % 赢家的速度
+            final_tracks_log(i).Angle = winner_detection.Angle;       % 赢家的俯仰角
+            final_tracks_log(i).Azimuth = final_azimuth;              % 加权平均的方位角
+            final_tracks_log(i).Power = max(powers);
+            
+            % (可选) 存储航迹的统计信息
+            frames_in_cluster = [detections_in_cluster.iFrame];
+            final_tracks_log(i).FirstFrame = min(frames_in_cluster);
+            final_tracks_log(i).LastFrame = max(frames_in_cluster);
+            final_tracks_log(i).NumPoints = length(frames_in_cluster);
+        end
+    end
+else
+    fprintf('--- 5. 帧间聚类被禁用，使用未聚类的日志进行绘图 ---\n');
+    % (将 cumulative_final_log 转换为 final_tracks_log 的格式)
+    num_detections = length(cumulative_final_log);
+    final_tracks_log = repmat(struct('Range', 0, 'Velocity', 0, 'Angle', 0, 'Azimuth', 0, 'Power', 0, 'FirstFrame', 0, 'LastFrame', 0, 'NumPoints', 0), num_detections, 1);
+    for i=1:num_detections
+       final_tracks_log(i).Range = cumulative_final_log(i).Range;
+       final_tracks_log(i).Velocity = cumulative_final_log(i).Velocity;
+       final_tracks_log(i).Angle = cumulative_final_log(i).Angle;
+       final_tracks_log(i).Azimuth = cumulative_final_log(i).iAntAngle;
+       final_tracks_log(i).Power = cumulative_final_log(i).Power;
+       final_tracks_log(i).FirstFrame = cumulative_final_log(i).iFrame;
+       final_tracks_log(i).LastFrame = cumulative_final_log(i).iFrame;
+       final_tracks_log(i).NumPoints = 1;
+    end
+end
+
+%% 6. 最终可视化 (基于 "帧间聚类" 的结果)
+% =========================================================================
+if ~isempty(final_tracks_log)
+    fprintf('--- 6. 正在生成最终航迹的可视化图表 ---\n');
+    
+    % 提取 *最终航迹* 的 R, V, El, Az
+    all_ranges = [final_tracks_log.Range];
+    all_velocities = [final_tracks_log.Velocity];
+    all_angles_el = [final_tracks_log.Angle];
+    all_angles_az = [final_tracks_log.Azimuth];
+    all_num_points = [final_tracks_log.NumPoints]; % (用点数来控制大小)
+    
+    % --- 绘制 距离-方位角 (PPI) 航迹图 ---
+    figure('Name', '最终航迹图 (PPI 视图)');
+    polarscatter(deg2rad(all_angles_az), all_ranges, all_num_points*10 + 20, all_velocities, 'filled');
+    title(sprintf('最终 %d 条航迹 (距离 vs. 方位角)', length(final_tracks_log)));
+    
+    % --- 绘制 距离-俯仰角 (RHI) 航迹图 ---
+    figure('Name', '最终航迹图 (RHI 视图)');
+    scatter(all_ranges, all_angles_el, all_num_points*10 + 20, all_velocities, 'filled');
+    xlabel('距离 (m)');
+    ylabel('俯仰角 (度)');
+    title(sprintf('最终 %d 条航迹 (距离 vs. 俯仰角)', length(final_tracks_log)));
+    grid on;
+    h_cb = colorbar;
+    ylabel(h_cb, '速度 (m/s)');
+    
+else
+    fprintf('--- 仿真结束，未检测到任何最终航迹。 ---\n');
+end
+
+% --- (可选) 绘制 "聚类前" 和 "聚类后" 的对比图 ---
+if config.inter_frame_cluster.enable && ~isempty(cumulative_final_log)
+    figure('Name', '帧间聚类对比 (PPI)');
+    
+    % 聚类前 (原始检测点)
+    subplot(1, 2, 1);
+    plot_az_pre = [cumulative_final_log.iAntAngle];
+    plot_r_pre = [cumulative_final_log.Range];
+    polarscatter(deg2rad(plot_az_pre), plot_r_pre, 20, 'r', 'filled', 'MarkerFaceAlpha', 0.5);
+    title(sprintf('聚类前 (%d 个检测点)', length(cumulative_final_log)));
+    
+    % 聚类后 (最终航迹)
+    subplot(1, 2, 2);
+    plot_az_post = [final_tracks_log.Azimuth];
+    plot_r_post = [final_tracks_log.Range];
+    polarscatter(deg2rad(plot_az_post), plot_r_post, 40, 'b', 'filled');
+    title(sprintf('聚类后 (%d 条航迹)', length(final_tracks_log)));
+end
